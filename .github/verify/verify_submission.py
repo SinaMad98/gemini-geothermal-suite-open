@@ -538,6 +538,104 @@ def section_repo():
     restore()
 
 
+def corrected_table(pm, roughness, fix_injector):
+    original = pm.build_project
+
+    def table(design, a):
+        captured = {}
+
+        def capture(p):
+            for w in ("producer_well", "injector_well"):
+                p["components"][w]["parameters"]["roughness_m"] = roughness
+            solver = original(p)
+            captured[id(p)] = solver
+            return solver
+
+        pm.build_project = capture
+        try:
+            rows = pm.build_well_table(design, a)
+        finally:
+            pm.build_project = original
+        if not fix_injector:
+            return rows
+        by_q = {}
+        for solver in captured.values():
+            try:
+                by_q[solver.get_output("producer_well", "flow_rate")] = solver.get_output("filter_b", "pressure_out_pa")
+            except Exception:
+                continue
+        z = design.well_depth_m
+        rho = pm.BRINE_DENSITY
+        pi = rows[0]["pi_m3h_bar"] if rows else 1.0
+        for r in rows:
+            q = r["q_m3h"]
+            f, v, _ = swamee_jain(rho, pm.BRINE_VISCOSITY, q / 3600, a.tubing_id_m, roughness)
+            fric = f * z / a.tubing_id_m * rho * v * v / 2
+            need = (pm.reservoir_pressure(z) + q / pi) * 1e5 - rho * 9.81 * z + fric
+            hyd = q / 3600 * max(0.0, need - by_q[q])
+            r["inj_hydraulic_w"] = hyd
+            r["inj_pump_w"] = hyd / pm.PUMP_EFFICIENCY
+        return rows
+
+    return table
+
+
+def section_impact(pm, dp):
+    s = "10 Impact of corrected injector and roughness"
+    restore()
+    dates, H, C = dp.load_demand(SUB)
+    a = pm.Assumptions()
+    design, _ = submitted(pm)
+    original = dp.build_well_table
+    rows = []
+
+    def evaluate(d, roughness, fix):
+        dp.build_well_table = corrected_table(pm, roughness, fix)
+        try:
+            df = dp.Plant(d, a).simulate_year(dates, H, C)
+        except RuntimeError as e:
+            return dict(design=d.label(), roughness_m=roughness, injector_fixed=fix, feasible=False, note=str(e))
+        finally:
+            dp.build_well_table = original
+        checks = dp.validate(df, d)
+        m = df.net_elec_MW.sum() * 24
+        return dict(
+            design=d.label(),
+            depth=d.well_depth_m,
+            stages=d.esp_stages,
+            roughness_m=roughness,
+            injector_fixed=fix,
+            feasible=all(ok for _, ok, _ in checks),
+            failed="; ".join(n for n, ok, _ in checks if not ok),
+            co2_t=round(df.co2_t.sum(), 1),
+            net_elec_MWh=round(m, 0),
+            esp_MWh=round(df.esp_elec_MW.sum() * 24, 0),
+            inj_MWh=round(df.inj_pump_elec_MW.sum() * 24, 0),
+            geo_share=round(100 * (df.heat_hex_MW + df.heat_hp_MW).sum() / (df.heat_hex_MW + df.heat_hp_MW + df.heat_produced_gas_MW + df.heat_backup_boiler_MW).sum(), 1),
+            max_flow=round(df.flow_per_doublet_m3h.max(), 1),
+            min_flow=round(df[df.geothermal_active].flow_per_doublet_m3h.min(), 1),
+        )
+
+    base = evaluate(design, 0.01, False)
+    close_check(s, "baseline wrapper reproduces 6626", base.get("co2_t"), 6626.4, 0.2)
+    for rough, fix in ((0.01, True), (4.6e-5, False), (4.6e-5, True)):
+        r = evaluate(design, rough, fix)
+        rows.append(r)
+        rec(s, f"submitted design, roughness {rough} m, injector fixed {fix}", "INFO", r)
+    for rough in (0.01, 4.6e-5):
+        for depth in (2500.0, 2800.0, 3000.0, 3200.0, 3300.0, 3500.0):
+            for stages in (15, 30, 45, 60):
+                d = pm.Design(n_doublets=3, well_depth_m=depth, hex_ua_w_per_k=2000e3, esp_stages=stages, backup_boiler_mw=35, electric_chiller_mw=15, absorption_chiller_mw=8)
+                rows.append(evaluate(d, rough, True))
+    t = pd.DataFrame(rows)
+    t.to_csv(OUT / "impact.csv", index=False)
+    for rough in (0.01, 4.6e-5):
+        g = t[(t.roughness_m == rough) & (t.feasible == True) & (t.injector_fixed == True) & t.depth.notna()]  # noqa: E712
+        for depth, sub in g.groupby("depth"):
+            b = sub.sort_values("co2_t").iloc[0]
+            rec(s, f"best with fix, roughness {rough}, {depth:.0f} m", "INFO", f"{b.co2_t} t, stages {b.stages}, ESP {b.esp_MWh} MWh, injector {b.inj_MWh} MWh")
+
+
 def write_report():
     df = pd.DataFrame(RESULTS)
     df.to_csv(OUT / "results.csv", index=False)
@@ -578,6 +676,7 @@ def main():
     guarded(section_fuzz, pm, dp)
     guarded(section_mock_llm)
     guarded(section_repo)
+    guarded(section_impact, pm, dp)
     plots = SUB / "plots"
     if plots.exists():
         shutil.copytree(plots, OUT / "plots", dirs_exist_ok=True)
