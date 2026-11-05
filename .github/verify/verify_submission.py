@@ -542,13 +542,13 @@ def corrected_table(pm, roughness, fix_injector):
     original = pm.build_project
 
     def table(design, a):
-        captured = {}
+        captured = []
 
         def capture(p):
             for w in ("producer_well", "injector_well"):
                 p["components"][w]["parameters"]["roughness_m"] = roughness
             solver = original(p)
-            captured[id(p)] = solver
+            captured.append(solver)
             return solver
 
         pm.build_project = capture
@@ -559,7 +559,7 @@ def corrected_table(pm, roughness, fix_injector):
         if not fix_injector:
             return rows
         by_q = {}
-        for solver in captured.values():
+        for solver in captured:
             try:
                 by_q[solver.get_output("producer_well", "flow_rate")] = solver.get_output("filter_b", "pressure_out_pa")
             except Exception:
